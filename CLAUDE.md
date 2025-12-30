@@ -1,10 +1,36 @@
-# CLAUDE.md
+# CLAUDE.md - Immo Agent Marseille
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides guidance to Claude Code (claude.ai/code) when working with this repository.
 
 ## Project Overview
 
-Immo-Agent is a judicial real estate auction tracker for the Marseille, Aix-en-Provence, and Toulon regions (departments 13 and 83 in France). It scrapes auction listings, extracts data from legal documents (procès-verbaux), compares prices against official market data (DVF), and provides opportunity scoring.
+Immo-Agent Marseille is a judicial real estate auction tracker for the Marseille, Aix-en-Provence, and Toulon regions (departments 13 and 83 in France). It scrapes auction listings from multiple sources, extracts data from legal documents (procès-verbaux), compares prices against official market data (DVF), and provides opportunity scoring.
+
+## Service Info
+
+| Property | Value |
+|----------|-------|
+| **Service Name** | immo-marseille |
+| **Port** | 8501 |
+| **Type** | Streamlit |
+| **URL** | http://localhost:8501 |
+| **GitHub** | https://github.com/decletyarnaud-cyber/immo-agent-marseille |
+| **launchd** | `com.ade.immo-marseille` |
+
+### Service Management
+
+```bash
+# Via pctl (recommended)
+pctl start immo-marseille
+pctl stop immo-marseille
+pctl restart immo-marseille
+pctl logs immo-marseille
+pctl open immo-marseille
+
+# Direct launchctl
+launchctl load ~/Library/LaunchAgents/com.ade.immo-marseille.plist
+launchctl unload ~/Library/LaunchAgents/com.ade.immo-marseille.plist
+```
 
 ## Commands
 
@@ -24,47 +50,108 @@ python main.py run-all         # Full pipeline: scrape + analyze
 python scheduler.py            # Run daemon (scrapes daily at 06:00)
 python scheduler.py --once     # Single execution
 python scheduler.py --run-now  # Execute immediately then continue as daemon
+
+# Direct Streamlit start
+streamlit run src/web/app.py --server.port 8501
 ```
 
 ## Architecture
 
 ### Data Flow
+
 ```
 Scrapers → Database (SQLite) → Analysis (DVF comparison) → Web UI / CSV Export
 ```
 
 ### Core Modules
 
-**Scrapers** (`src/scrapers/`): Each scraper inherits from `BaseScraper` and implements site-specific parsing. Sources: Licitor, Enchères-Publiques, Vench, plus lawyer website scraper for PV documents.
+**Scrapers** (`src/scrapers/`):
+- `LicitorScraper`: Scrapes licitor.com tribunal listings
+- `EncherePubliquesScraper`: Scrapes encheres-publiques.com
+- `VenchScraper`: Scrapes vench.fr
+- `LawyerScraper`: Extracts PV documents from lawyer websites
+- `BaseScraper`: Abstract base class for all scrapers
 
-**Extractors** (`src/extractors/`): PDF parsing with `pdfplumber`/`PyMuPDF`, OCR fallback via `pytesseract` for image-based PDFs. `PVDataExtractor` extracts structured data (address, surface, charges, occupation status).
+**Extractors** (`src/extractors/`):
+- `PDFParser`: PDF text extraction with pdfplumber/PyMuPDF
+- `OCRHandler`: Fallback OCR via pytesseract for image PDFs
+- `DataExtractor`: Structured data extraction from PV documents
+- `LLMExtractor`: Claude-powered extraction for complex documents
 
 **Analysis** (`src/analysis/`):
-- `DVFClient` downloads and queries official French real estate transaction data
-- `MarketAnalyzer` finds comparable sales and calculates market price/m²
-- `PropertyValuator` computes opportunity scores (0-100) based on discount vs market
+- `DVFClient`: Downloads/queries official French transaction data
+- `MarketAnalyzer`: Finds comparable sales, calculates €/m²
+- `PropertyValuator`: Computes opportunity scores (0-100)
+- `NeighborhoodAnalyzer`: Analyzes area characteristics
 
 **Storage** (`src/storage/`):
-- `Database` (SQLite) with `auctions` and `lawyers` tables
-- `CSVHandler` for exports
-- Core models: `Auction`, `Lawyer`, `DVFTransaction`
+- `Database`: SQLite with auctions, lawyers tables
+- `CSVHandler`: CSV export functionality
+- Models: `Auction`, `Lawyer`, `DVFTransaction`
 
-**Web** (`src/web/app.py`): Streamlit dashboard with search, filtering, opportunity badges, and CSV export.
+**Web** (`src/web/app.py`):
+- Streamlit dashboard
+- Search and filtering
+- Opportunity badges
+- Map visualization (Folium)
+- CSV export
 
 ### Key Data Models
 
-`Auction`: Main entity with address, surface, mise_a_prix, date_vente, dates_visite, tribunal, lawyer_id, pv_status, score_opportunite, decote_pourcentage.
+**Auction**:
+- `address`, `surface`, `mise_a_prix`
+- `date_vente`, `dates_visite`
+- `tribunal`, `lawyer_id`
+- `pv_status`, `pv_url`
+- `score_opportunite`, `decote_pourcentage`
+- `prix_m2_marche`, `prix_m2_vente`
 
-Opportunity scoring thresholds (in `config/settings.py`):
-- Good deal: 20% below market
-- Opportunity: 30% below market
+### Opportunity Scoring
 
-### Configuration
+Thresholds in `config/settings.py`:
+- **Good deal**: 20%+ below market
+- **Opportunity**: 30%+ below market
+- **Excellent**: 40%+ below market
 
-All settings in `config/settings.py`: geographic scope (CITIES, DEPARTMENTS), source URLs, scraping delays, DVF endpoints, analysis thresholds.
+## Data Sources
 
-Lawyer websites configured in `config/lawyers_config.yaml`.
+1. **Licitor** (licitor.com) - Tribunal auction listings
+2. **Enchères-Publiques** (encheres-publiques.com) - Aggregator
+3. **Vench** (vench.fr) - Additional source
+4. **DVF** (data.gouv.fr) - Official transaction data
+5. **Lawyer websites** - PV documents
+
+## Configuration
+
+### config/settings.py
+
+```python
+DEPARTMENTS = ["13", "83"]  # Bouches-du-Rhône, Var
+CITIES = ["Marseille", "Aix-en-Provence", "Toulon", ...]
+TRIBUNAUX = ["TJ Marseille", "TJ Aix-en-Provence", "TJ Toulon"]
+```
+
+### config/lawyers_config.yaml
+
+Lawyer website configurations for PV document scraping.
+
+## Database
+
+SQLite database at `data/auctions.db`:
+
+```sql
+-- Main tables
+auctions (id, address, surface, mise_a_prix, date_vente, ...)
+lawyers (id, name, email, phone, tribunal, website)
+dvf_transactions (id, address, price, surface, date, ...)
+```
 
 ## Language Note
 
-This project uses French for domain terms (enchères, tribunal, avocat, mise à prix, procès-verbal). Code comments and variable names mix French domain terms with English programming conventions.
+This project uses French domain terms:
+- **enchères** = auctions
+- **tribunal** = court
+- **avocat** = lawyer
+- **mise à prix** = starting price
+- **procès-verbal (PV)** = auction report/minutes
+- **adjudication** = sale/award
