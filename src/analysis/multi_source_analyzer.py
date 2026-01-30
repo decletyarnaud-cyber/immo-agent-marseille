@@ -240,7 +240,7 @@ class MultiSourceAnalyzer:
                 'geographic_match': estimate.geographic_match,
                 'source_url': estimate.source_url,
                 'notes': estimate.notes,
-                'comparables': estimate.comparables[:5],  # Top 5 for display
+                'comparables': estimate.comparables[:30],  # All for map display
             }
 
         return details

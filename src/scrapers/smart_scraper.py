@@ -172,21 +172,30 @@ class SmartScraper:
                     # We'll need auction ID after saving - for now store URLs
                     pass
 
+                # Geocode the auction to get GPS coordinates
+                auction = self.licitor.geocode_auction(auction)
+
                 return auction
             else:
                 logger.warning(f"[SmartScraper] LLM extraction failed, falling back to regex")
 
         # Fallback to regex-based scraper
+        auction = None
         if "licitor" in url or "licitor" in source:
-            return self.licitor.parse_auction_detail(url)
+            auction = self.licitor.parse_auction_detail(url)
         elif "encheres-publiques" in url or "encheres_publiques" in source:
-            return self.encheres_publiques.parse_auction_detail(url)
+            auction = self.encheres_publiques.parse_auction_detail(url)
         else:
             # Try both
             auction = self.licitor.parse_auction_detail(url)
             if not auction:
                 auction = self.encheres_publiques.parse_auction_detail(url)
-            return auction
+
+        # Geocode the auction to get GPS coordinates
+        if auction:
+            auction = self.licitor.geocode_auction(auction)
+
+        return auction
 
     def scrape_licitor(self) -> List[Auction]:
         """Scrape all auctions from Licitor using smart extraction"""

@@ -404,3 +404,100 @@ class DVFClient:
         # Sort by date (most recent first) and limit
         transactions.sort(key=lambda t: t.date_mutation or date.min, reverse=True)
         return transactions[:limit]
+
+    def find_comparable_sales_by_distance(
+        self,
+        latitude: float,
+        longitude: float,
+        type_local: str = "Appartement",
+        max_distance_km: float = 0.3,  # 300m default
+        months: int = 24,
+        limit: int = 20
+    ) -> List[DVFTransaction]:
+        """
+        Find comparable sales by geographic distance.
+        Priority is given to proximity over other criteria.
+
+        Args:
+            latitude: Latitude of the property
+            longitude: Longitude of the property
+            type_local: Property type (Appartement, Maison, etc.)
+            max_distance_km: Maximum distance in km (default 300m)
+            months: Number of months to look back
+            limit: Maximum results
+
+        Returns:
+            List of comparable transactions sorted by distance
+        """
+        from datetime import timedelta
+        from src.utils.geocoding import haversine_distance
+
+        # Determine department from coordinates
+        # Marseille area (lat ~43.3, lon ~5.3-5.5) -> 13
+        # Toulon area (lat ~43.1, lon ~5.9-6.1) -> 83
+        if longitude < 5.7:
+            dept = "13"
+        else:
+            dept = "83"
+
+        # Load all transactions for the department
+        all_transactions = self.load_data(dept)
+        if not all_transactions:
+            logger.warning(f"No DVF data found for department {dept}")
+            return []
+
+        # Filter by date and type
+        date_min = date.today() - timedelta(days=months * 30)
+        filtered = []
+
+        for t in all_transactions:
+            # Must have coordinates
+            if not t.latitude or not t.longitude:
+                continue
+
+            # Must match type
+            if type_local and t.type_local:
+                if type_local.lower() not in t.type_local.lower():
+                    continue
+
+            # Must be recent enough
+            if t.date_mutation and t.date_mutation < date_min:
+                continue
+
+            # Must have valid price per m²
+            if not t.prix_m2 or t.prix_m2 < 500 or t.prix_m2 > 15000:
+                continue
+
+            # Calculate distance
+            distance = haversine_distance(latitude, longitude, t.latitude, t.longitude)
+            t.distance_km = distance  # Add distance as attribute
+
+            filtered.append(t)
+
+        # Sort by distance
+        filtered.sort(key=lambda t: t.distance_km)
+
+        # Filter by max distance
+        nearby = [t for t in filtered if t.distance_km <= max_distance_km]
+
+        # Target at least 10 comparables for reliable price estimate
+        MIN_TARGET_COMPARABLES = 10
+
+        # If not enough results, expand the radius progressively
+        if len(nearby) < MIN_TARGET_COMPARABLES:
+            nearby = [t for t in filtered if t.distance_km <= max_distance_km * 2]  # 600m
+            logger.info(f"Expanded search radius to {max_distance_km * 2:.1f}km, found {len(nearby)} comparables")
+
+        if len(nearby) < MIN_TARGET_COMPARABLES:
+            nearby = [t for t in filtered if t.distance_km <= max_distance_km * 3.33]  # ~1km
+            logger.info(f"Expanded search radius to ~1km, found {len(nearby)} comparables")
+
+        if len(nearby) < MIN_TARGET_COMPARABLES:
+            nearby = [t for t in filtered if t.distance_km <= max_distance_km * 5]  # ~1.5km
+            logger.info(f"Expanded search radius to ~1.5km, found {len(nearby)} comparables")
+
+        if len(nearby) < MIN_TARGET_COMPARABLES:
+            nearby = [t for t in filtered if t.distance_km <= max_distance_km * 10]  # ~3km
+            logger.info(f"Expanded search radius to ~3km, found {len(nearby)} comparables")
+
+        return nearby[:limit]

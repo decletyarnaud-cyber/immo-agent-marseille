@@ -85,14 +85,20 @@ class DVFPriceSource(PriceSource):
         for t in transactions:
             if t.prix_m2 and self.MIN_PRICE_M2 <= t.prix_m2 <= self.MAX_PRICE_M2:
                 valid_prices.append(t.prix_m2)
-                comparables_data.append({
+                comparable_entry = {
                     "date": t.date_mutation.isoformat() if t.date_mutation else None,
                     "adresse": t.adresse,
                     "commune": t.commune,
                     "surface": t.surface_reelle,
                     "prix": t.valeur_fonciere,
                     "prix_m2": round(t.prix_m2, 0),
-                })
+                    "latitude": t.latitude,
+                    "longitude": t.longitude,
+                }
+                # Add distance if available (from GPS-based search)
+                if hasattr(t, 'distance_km') and t.distance_km is not None:
+                    comparable_entry["distance_km"] = round(t.distance_km, 3)
+                comparables_data.append(comparable_entry)
 
         if len(valid_prices) < self.MIN_COMPARABLES:
             logger.warning(f"[DVFSource] Only {len(valid_prices)} valid comparables for {code_postal}")
@@ -128,7 +134,7 @@ class DVFPriceSource(PriceSource):
             nb_data_points=len(valid_prices),
             date_range_days=date_range,
             geographic_match="commune",
-            comparables=comparables_data[:10],  # Keep top 10 for display
+            comparables=comparables_data[:30],  # Keep up to 30 for display and map
             source_url=self.SOURCE_URL,
             notes=f"Médiane de {len(valid_prices)} transactions sur 24 mois",
         )

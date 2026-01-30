@@ -118,10 +118,10 @@ class MarketAnalyzer:
         )
 
     def _find_comparables(self, auction: Auction) -> List[DVFTransaction]:
-        """Find comparable transactions for an auction"""
-        if not auction.code_postal:
-            return []
-
+        """
+        Find comparable transactions for an auction.
+        Priority: GPS distance (300m) > Postal code fallback
+        """
         # Determine property type for DVF
         type_local = "Appartement"  # Default
         if auction.type_bien:
@@ -133,18 +133,37 @@ class MarketAnalyzer:
             }
             type_local = type_mapping.get(auction.type_bien.value, "Appartement")
 
-        # Get surface tolerance
+        # Priority 1: Search by GPS distance if coordinates available
+        if auction.latitude and auction.longitude:
+            comparables = self.dvf_client.find_comparable_sales_by_distance(
+                latitude=auction.latitude,
+                longitude=auction.longitude,
+                type_local=type_local,
+                max_distance_km=0.3,  # 300m ultra-precise
+                months=24,
+                limit=30,  # Increased to ensure at least 10 valid comparables
+            )
+            if comparables:
+                logger.info(f"Found {len(comparables)} comparables by GPS distance (avg: {sum(t.distance_km for t in comparables)/len(comparables):.2f}km)")
+                return comparables
+
+        # Priority 2: Fallback to postal code search
+        if not auction.code_postal:
+            return []
+
         surface = auction.surface or 50  # Default 50m² if unknown
         tolerance = 25  # 25% tolerance
 
-        return self.dvf_client.find_comparable_sales(
+        comparables = self.dvf_client.find_comparable_sales(
             code_postal=auction.code_postal,
             surface=surface,
             type_local=type_local,
             tolerance_percent=tolerance,
             months=24,
-            limit=20,
+            limit=30,  # Increased to ensure at least 10 valid comparables
         )
+        logger.info(f"Found {len(comparables)} comparables by postal code {auction.code_postal}")
+        return comparables
 
     def _calculate_market_price_m2(self, transactions: List[DVFTransaction]) -> Optional[float]:
         """Calculate median price per m² with outlier filtering"""
@@ -154,7 +173,7 @@ class MarketAnalyzer:
         # Filter out outliers: keep only reasonable prices (500-15000 €/m²)
         MIN_PRICE_M2 = 500   # Below this is likely a gift, family transfer, or error
         MAX_PRICE_M2 = 15000  # Above this is likely luxury or data error
-        MIN_VALID_COMPARABLES = 3  # Minimum for reliable estimate
+        MIN_VALID_COMPARABLES = 10  # Minimum for reliable estimate (increased for better accuracy)
 
         valid_prices = []
         for t in transactions:
@@ -234,16 +253,30 @@ class MarketAnalyzer:
             scores["recency"] = 0
 
         # Location match score (0-15 points)
-        # Based on how many comparables are in the same postal code
-        same_cp = sum(1 for t in comparables if t.code_postal == auction.code_postal)
-        if same_cp >= 5:
-            scores["location_match"] = 15
-        elif same_cp >= 3:
-            scores["location_match"] = 10
-        elif same_cp >= 1:
-            scores["location_match"] = 5
+        # Based on average distance of comparables (if available) or postal code match
+        has_distance = comparables and hasattr(comparables[0], 'distance_km') and comparables[0].distance_km is not None
+        if has_distance:
+            # Use GPS distance-based scoring
+            avg_distance = sum(t.distance_km for t in comparables if hasattr(t, 'distance_km') and t.distance_km is not None) / len(comparables)
+            if avg_distance <= 0.3:      # < 300m - excellent
+                scores["location_match"] = 15
+            elif avg_distance <= 0.5:    # < 500m - very good
+                scores["location_match"] = 12
+            elif avg_distance <= 1.0:    # < 1km - good
+                scores["location_match"] = 8
+            else:
+                scores["location_match"] = 5
         else:
-            scores["location_match"] = 0
+            # Fallback to postal code matching
+            same_cp = sum(1 for t in comparables if t.code_postal == auction.code_postal)
+            if same_cp >= 5:
+                scores["location_match"] = 15
+            elif same_cp >= 3:
+                scores["location_match"] = 10
+            elif same_cp >= 1:
+                scores["location_match"] = 5
+            else:
+                scores["location_match"] = 0
 
         return sum(scores.values())
 

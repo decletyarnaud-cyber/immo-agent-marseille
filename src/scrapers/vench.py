@@ -47,23 +47,36 @@ class VenchScraper(BaseScraper):
     def parse_auction_list(self, soup: BeautifulSoup) -> List[Dict[str, Any]]:
         """Parse auction listing page"""
         auctions = []
+        seen_urls = set()
 
-        # Find auction entries
-        cards = soup.select(".vente-item, .annonce, article, .listing-item")
+        # Method 1: Look for auction links directly (vente-XXXXX-... pattern with number)
+        for link in soup.find_all("a", href=True):
+            href = link.get("href", "")
+            # Must match vente-NUMBER pattern (actual auctions)
+            if re.search(r"vente-\d+", href) and href not in seen_urls:
+                # Build full URL
+                full_url = href if href.startswith("http") else f"{self.base_url}/{href.lstrip('./')}"
+                seen_urls.add(href)
 
-        if not cards:
-            # Try table structure
-            rows = soup.select("table tr, .ventes-list > div")
-            cards = rows
+                text = link.get_text(strip=True)
+                auctions.append({
+                    "url": full_url,
+                    "title": text
+                })
 
-        for card in cards:
-            try:
-                auction_data = self._parse_card(card)
-                if auction_data:
-                    auctions.append(auction_data)
-            except Exception as e:
-                logger.warning(f"[Vench] Error parsing card: {e}")
+        # Method 2: Try card/article structures if no links found
+        if not auctions:
+            cards = soup.select(".vente-item, .annonce, article, .listing-item, .vente-card")
+            for card in cards:
+                try:
+                    auction_data = self._parse_card(card)
+                    if auction_data and auction_data.get("url") not in seen_urls:
+                        seen_urls.add(auction_data.get("url"))
+                        auctions.append(auction_data)
+                except Exception as e:
+                    logger.warning(f"[Vench] Error parsing card: {e}")
 
+        logger.debug(f"[Vench] Found {len(auctions)} auction links")
         return auctions
 
     def _parse_card(self, card) -> Optional[Dict[str, Any]]:
@@ -119,6 +132,8 @@ class VenchScraper(BaseScraper):
         self._parse_property_info(soup, auction)
         self._parse_sale_info(soup, auction)
         self._parse_documents_links(soup, auction)
+        self._parse_photos(soup, auction)
+        self._parse_lawyer_info(soup, auction)
 
         return auction
 
@@ -148,10 +163,26 @@ class VenchScraper(BaseScraper):
             auction.code_postal = cp_match.group(1)
             auction.department = auction.code_postal[:2]
 
-        # Extract city
-        city_match = re.search(r"(?:13\d{3}|83\d{3})\s+([A-ZÀ-Ü][a-zà-ü\-]+(?:\s+[a-zà-ü\-]+)*)", full_text, re.IGNORECASE)
-        if city_match:
-            auction.ville = city_match.group(1).title()
+        # Extract city - multiple patterns
+        # Pattern 1: Known cities in the region (most reliable)
+        known_cities = [
+            "La Seyne-sur-Mer", "Aix-en-Provence", "Salon-de-Provence", "Fos-sur-Mer",
+            "Six-Fours-les-Plages", "Sanary-sur-Mer", "Le Pradet", "La Garde", "La Ciotat",
+            "Marseille", "Toulon", "Martigues", "Aubagne", "Cassis", "Miramas",
+            "Istres", "Vitrolles", "Marignane", "Arles", "Hyères", "Fréjus",
+            "Draguignan", "Bandol", "Ollioules", "Carqueiranne", "Le Lavandou", "Gonfaron"
+        ]
+        full_text_lower = full_text.lower()
+        for city in known_cities:
+            if city.lower() in full_text_lower:
+                auction.ville = city
+                break
+
+        # Pattern 2: After postal code "13001 Marseille" (fallback)
+        if not auction.ville:
+            city_match = re.search(r"(?:13\d{3}|83\d{3})\s+([A-ZÀ-Ü][a-zà-ü\-]+(?:\s+[a-zà-ü\-]+)*)", full_text, re.IGNORECASE)
+            if city_match:
+                auction.ville = city_match.group(1).title()
 
     def _parse_property_info(self, soup: BeautifulSoup, auction: Auction):
         """Parse property details"""
@@ -159,11 +190,11 @@ class VenchScraper(BaseScraper):
 
         # Type
         type_mapping = {
-            PropertyType.APPARTEMENT: ["appartement", "studio", "f1", "f2", "f3", "f4", "f5"],
-            PropertyType.MAISON: ["maison", "villa", "pavillon"],
-            PropertyType.LOCAL_COMMERCIAL: ["local", "commerce", "bureau"],
+            PropertyType.APPARTEMENT: ["appartement", "studio", "f1", "f2", "f3", "f4", "f5", "t1", "t2", "t3", "t4", "t5"],
+            PropertyType.MAISON: ["maison", "villa", "pavillon", "propriété"],
+            PropertyType.LOCAL_COMMERCIAL: ["local", "commerce", "bureau", "boutique"],
             PropertyType.TERRAIN: ["terrain", "parcelle"],
-            PropertyType.PARKING: ["parking", "garage", "box"],
+            PropertyType.PARKING: ["parking", "garage", "box", "stationnement"],
         }
 
         for prop_type, keywords in type_mapping.items():
@@ -171,15 +202,32 @@ class VenchScraper(BaseScraper):
                 auction.type_bien = prop_type
                 break
 
-        # Surface
-        surface_match = re.search(r"(\d+(?:[.,]\d+)?)\s*m[²2]", text)
-        if surface_match:
-            auction.surface = float(surface_match.group(1).replace(",", "."))
+        # Surface - multiple patterns
+        surface_patterns = [
+            r"surface[:\s]+(?:de\s+)?(\d+(?:[.,]\d+)?)\s*m[²2]",
+            r"(\d+(?:[.,]\d+)?)\s*m[²2]\s*(?:environ|habitable|utile)?",
+            r"(\d+(?:[.,]\d+)?)\s*m²",
+        ]
+        for pattern in surface_patterns:
+            surface_match = re.search(pattern, text)
+            if surface_match:
+                auction.surface = float(surface_match.group(1).replace(",", "."))
+                break
 
-        # Rooms
-        pieces_match = re.search(r"(\d+)\s*(?:pièces?|pieces?)", text)
+        # Rooms (pièces)
+        pieces_match = re.search(r"(\d+)\s*(?:pièces?|pieces?|p\.)", text)
         if pieces_match:
             auction.nb_pieces = int(pieces_match.group(1))
+
+        # Bedrooms (chambres)
+        chambres_match = re.search(r"(\d+)\s*(?:chambres?|ch\.)", text)
+        if chambres_match:
+            auction.nb_chambres = int(chambres_match.group(1))
+
+        # Floor (étage)
+        etage_match = re.search(r"(\d+)(?:e|ème|er|eme)?\s*étage", text)
+        if etage_match:
+            auction.etage = int(etage_match.group(1))
 
     def _parse_sale_info(self, soup: BeautifulSoup, auction: Auction):
         """Parse sale date, time, price"""
@@ -301,6 +349,95 @@ class VenchScraper(BaseScraper):
         if not auction.pv_url:
             auction.pv_status = PVStatus.A_DEMANDER
 
+    def _parse_photos(self, soup: BeautifulSoup, auction: Auction):
+        """Parse photo URLs from the page"""
+        photos = []
+
+        # Look for images in various containers
+        img_selectors = [
+            ".photo img", ".photos img", ".gallery img", ".slider img",
+            ".carousel img", ".swiper-slide img", ".vente-photo img",
+            ".annonce-photo img", "img.photo", "img.vente-img",
+            ".fiche-lot img", ".detail-photo img"
+        ]
+
+        for selector in img_selectors:
+            for img in soup.select(selector):
+                src = img.get("src") or img.get("data-src") or img.get("data-lazy")
+                if src and self._is_valid_photo(src):
+                    full_url = src if src.startswith("http") else f"{self.base_url}/{src.lstrip('/')}"
+                    if full_url not in photos:
+                        photos.append(full_url)
+
+        # Fallback: look for any large images
+        if not photos:
+            for img in soup.find_all("img"):
+                src = img.get("src", "")
+                # Exclude small icons, logos, etc.
+                if src and self._is_valid_photo(src):
+                    width = img.get("width", "")
+                    height = img.get("height", "")
+                    # Parse dimensions (handle "100%", "auto", etc.)
+                    try:
+                        w = int(width) if width and width.isdigit() else 200
+                        h = int(height) if height and height.isdigit() else 200
+                    except (ValueError, TypeError):
+                        w, h = 200, 200
+                    # Only include if dimensions suggest it's a property photo
+                    if w > 100 and h > 100:
+                        full_url = src if src.startswith("http") else f"{self.base_url}/{src.lstrip('/')}"
+                        if full_url not in photos:
+                            photos.append(full_url)
+
+        auction.photos = photos[:10]  # Limit to 10 photos
+
+    def _is_valid_photo(self, src: str) -> bool:
+        """Check if image URL is likely a property photo"""
+        src_lower = src.lower()
+        # Exclude common non-property images
+        exclude_patterns = [
+            "logo", "icon", "avatar", "banner", "button", "social",
+            "facebook", "twitter", "linkedin", "youtube", "sprite",
+            "placeholder", "loading", "default", "no-image"
+        ]
+        if any(pat in src_lower for pat in exclude_patterns):
+            return False
+        # Must be an image file
+        if not any(ext in src_lower for ext in [".jpg", ".jpeg", ".png", ".webp", ".gif"]):
+            return False
+        return True
+
+    def _parse_lawyer_info(self, soup: BeautifulSoup, auction: Auction):
+        """Parse lawyer information and store directly on auction"""
+        text = soup.get_text()
+
+        # Try to find Maitre name
+        me_match = re.search(r"(?:Maître|Me|Maitre)\s+([A-ZÀ-Ü][a-zà-ü]+(?:\s+[A-ZÀ-Ü][a-zà-ü]+)*)", text)
+        if me_match:
+            auction.avocat_nom = f"Me {me_match.group(1)}"
+
+        # Phone
+        phone_match = re.search(r"(?:Tél|Tel|Téléphone)\s*:?\s*([\d\s.]+)", text)
+        if phone_match:
+            auction.avocat_telephone = phone_match.group(1).strip()
+
+        # Email
+        email_match = re.search(r"([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})", text)
+        if email_match:
+            auction.avocat_email = email_match.group(1)
+
+        # Try structured section
+        lawyer_section = soup.select_one(".avocat, .contact, .vendeur, .poursuivant")
+        if lawyer_section:
+            if not auction.avocat_nom:
+                name_elem = lawyer_section.select_one(".nom, strong, h4, b")
+                if name_elem:
+                    auction.avocat_nom = name_elem.get_text(strip=True)
+
+            site = lawyer_section.select_one("a[href*='avocat']")
+            if site:
+                auction.avocat_site_web = site.get("href", "")
+
     def extract_lawyer_info(self, soup: BeautifulSoup) -> Optional[Lawyer]:
         """Extract lawyer information"""
         lawyer = Lawyer()
@@ -353,6 +490,8 @@ class VenchScraper(BaseScraper):
                         if auction:
                             if not auction.tribunal:
                                 auction.tribunal = tribunal_info["nom"]
+                            # Geocode the auction to get GPS coordinates
+                            auction = self.geocode_auction(auction)
                             all_auctions.append(auction)
 
         logger.info(f"[Vench] Total: {len(all_auctions)} auctions scraped")

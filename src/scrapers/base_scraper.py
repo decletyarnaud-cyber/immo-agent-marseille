@@ -18,8 +18,9 @@ logger.add(
 )
 
 sys.path.insert(0, str(__file__).rsplit("/", 3)[0])
-from config.settings import SCRAPING, ALL_POSTAL_CODES
+from config.settings import SCRAPING, ALL_POSTAL_CODES, DEPARTMENTS, is_in_target_area as settings_is_in_target_area
 from src.storage.models import Auction, Lawyer
+from src.utils.geocoding import geocode_address
 
 
 class BaseScraper(ABC):
@@ -65,8 +66,34 @@ class BaseScraper(ABC):
         return None
 
     def is_in_target_area(self, code_postal: str) -> bool:
-        """Check if postal code is in target area"""
-        return code_postal in ALL_POSTAL_CODES
+        """Check if postal code is in target area (with department fallback)"""
+        return settings_is_in_target_area(code_postal)
+
+    def geocode_auction(self, auction: Auction) -> Auction:
+        """
+        Geocode an auction's address and store coordinates.
+        Called during scraping to ensure all auctions have GPS coordinates.
+        """
+        if auction.latitude and auction.longitude:
+            return auction  # Already geocoded
+
+        lat, lon = geocode_address(
+            auction.adresse or "",
+            auction.ville or "",
+            auction.code_postal or ""
+        )
+
+        if lat and lon:
+            auction.latitude = lat
+            auction.longitude = lon
+            logger.debug(f"[{self.name}] Geocoded: {auction.adresse}, {auction.ville} -> ({lat:.6f}, {lon:.6f})")
+        else:
+            logger.warning(f"[{self.name}] Failed to geocode: {auction.adresse}, {auction.ville}, {auction.code_postal}")
+
+        # Rate limiting for geocoding API
+        time.sleep(0.2)
+
+        return auction
 
     @abstractmethod
     def get_auction_list_url(self, page: int = 1) -> str:
@@ -115,6 +142,8 @@ class BaseScraper(ABC):
                 if "url" in data:
                     auction = self.parse_auction_detail(data["url"])
                     if auction:
+                        # Geocode the auction to get GPS coordinates
+                        auction = self.geocode_auction(auction)
                         all_auctions.append(auction)
 
             logger.info(f"[{self.name}] Page {page}: found {len(auction_data)} auctions")

@@ -15,10 +15,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 from config.settings import WEB, CITIES
 from config.lawyers_catalog import find_lawyer_info, get_encheres_url
 from src.storage.database import Database
-from src.storage.models import PropertyType, AuctionStatus
+from src.storage.models import PropertyType, AuctionStatus, ConsolidatedAuction
+from src.web.components.sources_tab import render_sources_tab
+from src.web.components.validation_tab import render_validation_tab, render_validation_summary
 from src.services.lawyer_finder import get_lawyer_finder
 from src.analysis.multi_source_analyzer import MultiSourceAnalyzer
 from src.analysis.neighborhood_analyzer import NeighborhoodAnalyzer
+from src.utils.geocoding import geocode_address, haversine_distance
 
 # Page configuration
 st.set_page_config(
@@ -248,17 +251,14 @@ def main():
 
     # Show notification if auction selected from calendar
     if st.session_state.get('selected_auction_id'):
-        st.toast("📋 Annonce sélectionnée ! Allez à l'onglet 'Analyse détaillée'", icon="📅")
+        st.toast("📋 Annonce sélectionnée ! Allez à l'onglet 'Analyses' > 'Analyse détaillée'", icon="📅")
 
-    # Main tabs
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
+    # Main tabs (simplified to 5)
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
         "📊 Tableau de bord",
-        "📅 Calendrier visites",
+        "📅 Calendrier",
         "🗺️ Carte",
-        "🔍 Toutes les enchères",
-        "⭐ Opportunités",
-        "📈 Prix par quartier",
-        "📋 Analyse détaillée",
+        "📋 Analyses",
         "⚙️ Paramètres"
     ])
 
@@ -266,24 +266,15 @@ def main():
         show_dashboard(db)
 
     with tab2:
-        show_visits_calendar(db)
+        show_calendar_tab(db)
 
     with tab3:
         show_interactive_map(db)
 
     with tab4:
-        show_all_auctions(db)
+        show_analyses_tab(db)
 
     with tab5:
-        show_opportunities(db)
-
-    with tab6:
-        show_neighborhood_prices()
-
-    with tab7:
-        show_detailed_analysis(db)
-
-    with tab8:
         show_settings(db)
 
 
@@ -315,8 +306,13 @@ def show_interactive_map(db: Database):
         show_clusters = st.checkbox("Regrouper les marqueurs", value=True, key="map_clusters")
 
     # Filter auctions
+    today = date.today()
     filtered_auctions = []
     for auction in auctions:
+        # Exclude past auctions
+        if auction.date_vente and auction.date_vente < today:
+            continue
+
         # Type filter
         if filter_type != "Tous":
             type_map = {
@@ -446,17 +442,21 @@ def show_interactive_map(db: Database):
 
 def show_visits_calendar(db: Database):
     """Interactive calendar showing upcoming property visits"""
-    st.subheader("📅 Calendrier des Visites")
+    st.subheader("👁️ Calendrier des Visites")
 
     # Get all upcoming auctions with visit dates
     auctions = db.get_upcoming_auctions(days=90)
+
+    # Filter: only keep auctions with future sale dates
+    today = date.today()
+    auctions = [a for a in auctions if a.date_vente and a.date_vente >= today]
 
     # Collect all visits
     all_visits = []
     for auction in auctions:
         if auction.dates_visite:
             for visite in auction.dates_visite:
-                if visite.date() >= date.today():
+                if visite.date() >= today:
                     all_visits.append({
                         'date': visite,
                         'auction': auction
@@ -575,7 +575,7 @@ def show_visits_calendar(db: Database):
                         # Button to go to detailed analysis
                         if st.button("📋 Voir analyse détaillée", key=f"analyze_{visit_key}", use_container_width=True):
                             st.session_state.selected_auction_id = auction.id
-                            st.info("👆 Cliquez sur l'onglet **📋 Analyse détaillée** pour voir l'analyse complète")
+                            st.info("👆 Cliquez sur l'onglet **📋 Analyses** > **Analyse détaillée** pour voir l'analyse complète")
                             st.rerun()
 
                         if auction.url:
@@ -653,6 +653,372 @@ def show_visits_calendar(db: Database):
             visite_date = visit['date']
             type_bien = auction.type_bien.value if auction.type_bien else "Bien"
             st.markdown(f"**{visite_date.strftime('%d/%m/%Y %Hh%M')}** - {type_bien} à {auction.ville} - {auction.mise_a_prix:,.0f}€".replace(",", " ") if auction.mise_a_prix else f"**{visite_date.strftime('%d/%m/%Y %Hh%M')}** - {type_bien} à {auction.ville}")
+
+
+def show_sales_calendar(db: Database):
+    """Interactive calendar showing upcoming auction sale dates"""
+    st.subheader("🔨 Calendrier des Ventes")
+
+    # Get all upcoming auctions
+    auctions = db.get_upcoming_auctions(days=90)
+
+    # Filter: only keep auctions with future sale dates
+    today = date.today()
+    auctions = [a for a in auctions if a.date_vente and a.date_vente >= today]
+
+    if not auctions:
+        st.info("Aucune vente programmée dans les 90 prochains jours")
+        return
+
+    # Sort by sale date
+    auctions.sort(key=lambda a: a.date_vente)
+
+    # Initialize week offset in session state
+    if 'sales_week_offset' not in st.session_state:
+        st.session_state.sales_week_offset = 0
+
+    # Month quick jump buttons
+    months_with_auctions = {}
+    for a in auctions:
+        if a.date_vente:
+            month_key = a.date_vente.strftime('%Y-%m')
+            month_name = a.date_vente.strftime('%B %Y').capitalize()
+            if month_key not in months_with_auctions:
+                months_with_auctions[month_key] = {'name': month_name, 'count': 0, 'first_date': a.date_vente}
+            months_with_auctions[month_key]['count'] += 1
+
+    # French month names
+    month_names_fr = {
+        'January': 'Janvier', 'February': 'Février', 'March': 'Mars', 'April': 'Avril',
+        'May': 'Mai', 'June': 'Juin', 'July': 'Juillet', 'August': 'Août',
+        'September': 'Septembre', 'October': 'Octobre', 'November': 'Novembre', 'December': 'Décembre'
+    }
+
+    st.markdown("**Aller au mois :**")
+    month_cols = st.columns(len(months_with_auctions))
+    for i, (month_key, month_data) in enumerate(sorted(months_with_auctions.items())):
+        with month_cols[i]:
+            # Translate month name
+            month_name = month_data['name']
+            for en, fr in month_names_fr.items():
+                month_name = month_name.replace(en, fr)
+
+            if st.button(f"📅 {month_name} ({month_data['count']})", key=f"jump_{month_key}", use_container_width=True):
+                # Calculate week offset to jump to this month
+                first_date = month_data['first_date']
+                target_week_start = first_date - timedelta(days=first_date.weekday())
+                current_week_start = today - timedelta(days=today.weekday())
+                weeks_diff = (target_week_start - current_week_start).days // 7
+                st.session_state.sales_week_offset = weeks_diff
+                st.rerun()
+
+    st.markdown("---")
+
+    # Week navigation
+    col_nav1, col_nav2, col_nav3 = st.columns([1, 2, 1])
+
+    with col_nav1:
+        if st.button("◀ Semaine précédente", key="sales_prev"):
+            st.session_state.sales_week_offset -= 1
+
+    with col_nav3:
+        if st.button("Semaine suivante ▶", key="sales_next"):
+            st.session_state.sales_week_offset += 1
+
+    # Calculate current week dates
+    start_of_week = today - timedelta(days=today.weekday()) + timedelta(weeks=st.session_state.sales_week_offset)
+    end_of_week = start_of_week + timedelta(days=6)
+
+    with col_nav2:
+        st.markdown(f"### 📆 {start_of_week.strftime('%d/%m')} - {end_of_week.strftime('%d/%m/%Y')}")
+
+    # Filter auctions for current week
+    week_auctions = [a for a in auctions if start_of_week <= a.date_vente <= end_of_week]
+
+    # Summary metrics
+    st.markdown("---")
+    metric_col1, metric_col2, metric_col3, metric_col4 = st.columns(4)
+
+    with metric_col1:
+        st.metric("🔨 Cette semaine", len(week_auctions))
+    with metric_col2:
+        today_sales = len([a for a in auctions if a.date_vente == today])
+        st.metric("📍 Aujourd'hui", today_sales)
+    with metric_col3:
+        next_7_days = len([a for a in auctions if today <= a.date_vente <= today + timedelta(days=7)])
+        st.metric("🗓️ 7 prochains jours", next_7_days)
+    with metric_col4:
+        st.metric("📋 Total à venir", len(auctions))
+
+    st.markdown("---")
+
+    # Calendar grid - 7 days
+    days_fr = ["Lundi", "Mardi", "Mercredi", "Jeudi", "Vendredi", "Samedi", "Dimanche"]
+    day_cols = st.columns(7)
+
+    for i, col in enumerate(day_cols):
+        current_date = start_of_week + timedelta(days=i)
+        is_today = current_date == today
+        is_past = current_date < today
+
+        with col:
+            # Day header
+            header_style = "background:#ef4444; color:white;" if is_today else "background:rgba(30, 58, 95, 0.8); color:#ccd6e0;" if not is_past else "background:rgba(30, 58, 95, 0.4); color:#6b7280;"
+            st.markdown(f"""
+            <div style='{header_style} padding:0.5rem; border-radius:8px 8px 0 0; text-align:center; font-weight:600'>
+                {days_fr[i]}<br/>
+                <span style='font-size:1.2em'>{current_date.strftime('%d')}</span>
+            </div>
+            """, unsafe_allow_html=True)
+
+            # Get auctions for this day
+            day_auctions = [a for a in week_auctions if a.date_vente == current_date]
+
+            if day_auctions:
+                for idx, auction in enumerate(day_auctions):
+                    type_bien = auction.type_bien.value if auction.type_bien else "Bien"
+                    ville = auction.ville or "?"
+                    mise_prix = f"{auction.mise_a_prix:,.0f}€".replace(",", " ") if auction.mise_a_prix else "?"
+
+                    # Card color based on opportunity
+                    decote = auction.decote_pourcentage or 0
+                    if decote >= 30:
+                        badge = "🔥"
+                    elif decote >= 20:
+                        badge = "⭐"
+                    else:
+                        badge = "🔨"
+
+                    # Unique key for this sale
+                    sale_key = f"sale_{current_date}_{idx}_{auction.id}"
+
+                    # Clickable popover for each sale
+                    with st.popover(f"{badge} {type_bien[:4]}", use_container_width=True):
+                        st.markdown(f"### {type_bien.capitalize()} à {ville}")
+                        st.markdown(f"**📍 Adresse:** {auction.adresse or 'Non précisée'}")
+                        st.markdown(f"**💰 Mise à prix:** {mise_prix}")
+                        if auction.surface:
+                            st.markdown(f"**📐 Surface:** {auction.surface:.0f} m²")
+                        if decote > 0:
+                            st.markdown(f"**📉 Décote:** {decote:.0f}%")
+                        st.markdown(f"**🔨 Vente:** {auction.date_vente.strftime('%d/%m/%Y')}")
+                        if auction.heure_vente:
+                            st.markdown(f"**🕐 Heure:** {auction.heure_vente}")
+                        st.markdown(f"**⚖️ Tribunal:** {auction.tribunal or 'N/A'}")
+
+                        st.markdown("---")
+
+                        # Button to go to detailed analysis
+                        if st.button("📋 Voir analyse", key=f"analyze_{sale_key}", use_container_width=True):
+                            st.session_state.selected_auction_id = auction.id
+                            st.info("👆 Cliquez sur l'onglet **📋 Analyses** pour voir l'analyse complète")
+                            st.rerun()
+
+                        if auction.url:
+                            st.link_button("🔗 Voir l'annonce", auction.url, use_container_width=True)
+            else:
+                st.markdown("""
+                <div style='background:rgba(30, 58, 95, 0.3); padding:1rem; margin:0.3rem 0; border-radius:4px; text-align:center; color:#6b7280; font-size:0.8em'>
+                    -
+                </div>
+                """, unsafe_allow_html=True)
+
+    # Detailed list of this week's sales
+    st.markdown("---")
+    st.markdown("### 📋 Détail des ventes de la semaine")
+
+    if week_auctions:
+        for auction in week_auctions:
+            type_bien = auction.type_bien.value if auction.type_bien else "Bien"
+            mise_prix = f"{auction.mise_a_prix:,.0f}€".replace(",", " ") if auction.mise_a_prix else "?"
+            surface = f"{auction.surface:.0f}m²" if auction.surface else "?"
+            decote = auction.decote_pourcentage or 0
+
+            # Urgency indicator
+            days_until = (auction.date_vente - today).days
+            if days_until == 0:
+                urgency = "🔴 AUJOURD'HUI"
+                urgency_color = "#ef4444"
+            elif days_until == 1:
+                urgency = "🟠 DEMAIN"
+                urgency_color = "#f59e0b"
+            elif days_until <= 3:
+                urgency = f"🟡 Dans {days_until}j"
+                urgency_color = "#eab308"
+            else:
+                urgency = f"🟢 Dans {days_until}j"
+                urgency_color = "#10b981"
+
+            col1, col2, col3, col4 = st.columns([2, 3, 2, 1])
+
+            with col1:
+                st.markdown(f"""
+                <div style='background:{urgency_color}; color:white; padding:0.3rem 0.5rem; border-radius:6px; text-align:center; font-weight:600'>
+                    {auction.date_vente.strftime('%A %d/%m')}<br/>
+                    {auction.heure_vente or '?'}
+                </div>
+                """, unsafe_allow_html=True)
+
+            with col2:
+                st.markdown(f"**{type_bien.capitalize()} à {auction.ville}**")
+                st.caption(f"{auction.adresse or 'Adresse non précisée'}")
+
+            with col3:
+                st.markdown(f"**{mise_prix}** • {surface}")
+                if decote > 0:
+                    st.markdown(f"📉 Décote: **{decote:.0f}%**")
+
+            with col4:
+                if auction.url:
+                    st.link_button("Voir", auction.url, use_container_width=True)
+
+            st.markdown("<hr style='margin:0.5rem 0; border-color:rgba(90,127,168,0.3)'>", unsafe_allow_html=True)
+    else:
+        st.info("Aucune vente programmée cette semaine")
+
+    # Quick access to all upcoming sales (grouped by month)
+    with st.expander("📆 Toutes les ventes à venir"):
+        # Group by month for better navigation
+        months_fr = ["", "Janvier", "Février", "Mars", "Avril", "Mai", "Juin",
+                     "Juillet", "Août", "Septembre", "Octobre", "Novembre", "Décembre"]
+        current_month = None
+
+        for auction in auctions:
+            auction_month = auction.date_vente.month if auction.date_vente else 0
+            if auction_month != current_month:
+                current_month = auction_month
+                st.markdown(f"### 📅 {months_fr[current_month]} {auction.date_vente.year}")
+
+            type_bien = auction.type_bien.value if auction.type_bien else "Bien"
+            ville = auction.ville or "(non précisée)"
+            prix_str = f"{auction.mise_a_prix:,.0f}€".replace(",", " ") if auction.mise_a_prix else "Prix ?"
+            st.markdown(f"**{auction.date_vente.strftime('%d/%m/%Y')}** - {type_bien} à {ville} - {prix_str}")
+
+
+def show_calendar_tab(db: Database):
+    """Calendar tab with two sub-tabs: Visits and Sales"""
+    st.header("📅 Calendrier")
+
+    # Create sub-tabs
+    tab_visites, tab_ventes = st.tabs(["👁️ Visites", "🔨 Ventes"])
+
+    with tab_visites:
+        show_visits_calendar(db)
+
+    with tab_ventes:
+        show_sales_calendar(db)
+
+
+def show_analyses_tab(db: Database):
+    """Combined analyses tab with sub-tabs for list, opportunities, and detailed analysis"""
+    st.header("📋 Analyses")
+
+    # Create sub-tabs
+    tab_liste, tab_opportunites, tab_detail, tab_sources, tab_validation = st.tabs([
+        "🔍 Liste complète",
+        "⭐ Opportunités",
+        "📊 Analyse détaillée",
+        "📚 Multi-Sources",
+        "✅ Validation"
+    ])
+
+    with tab_liste:
+        show_all_auctions(db)
+
+    with tab_opportunites:
+        show_opportunities(db)
+
+    with tab_detail:
+        show_detailed_analysis(db)
+
+    with tab_sources:
+        show_consolidated_sources(db)
+
+    with tab_validation:
+        show_validation_panel(db)
+
+
+def show_consolidated_sources(db: Database):
+    """Show consolidated auctions with multi-source comparison"""
+    st.subheader("📚 Encheres Multi-Sources")
+
+    # Get consolidated auctions
+    consolidated = db.get_all_consolidated_auctions(limit=50)
+
+    if not consolidated:
+        st.info("Aucune enchere consolidee. Lancez 'python main.py consolidate' pour consolider les sources.")
+        return
+
+    # Stats
+    stats = db.get_consolidated_stats()
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("Encheres consolidees", stats.get("total_consolidated", 0))
+    with col2:
+        st.metric("Avec conflits", stats.get("with_conflicts", 0))
+    with col3:
+        st.metric("Confiance moyenne", f"{stats.get('avg_confidence', 0):.0f}%")
+
+    st.divider()
+
+    # Select auction to view
+    auction_options = {}
+    for auction in consolidated:
+        label = f"{auction.adresse[:40] if auction.adresse else 'Sans adresse'} - {auction.date_vente or 'Date ?'}"
+        auction_options[label] = auction
+
+    selected_label = st.selectbox(
+        "Selectionner une enchere:",
+        list(auction_options.keys()),
+        key="consolidated_select"
+    )
+
+    if selected_label:
+        selected_auction = auction_options[selected_label]
+
+        # Show source badges
+        st.markdown(f"**Sources:** {', '.join(selected_auction.sources)}")
+
+        # Render the sources comparison tab
+        render_sources_tab(selected_auction)
+
+
+def show_validation_panel(db: Database):
+    """Show auctions with conflicts that need user validation"""
+    st.subheader("✅ Validation des donnees")
+
+    # Get auctions with conflicts
+    with_conflicts = db.get_consolidated_with_conflicts()
+
+    if not with_conflicts:
+        st.success("Aucun conflit a resoudre ! Toutes les encheres sont validees.")
+        return
+
+    st.warning(f"{len(with_conflicts)} enchere(s) necessitent une validation")
+
+    # Select auction to validate
+    auction_options = {}
+    for auction in with_conflicts:
+        conflicts_count = len(auction.pending_validation)
+        label = f"{auction.adresse[:40] if auction.adresse else 'Sans adresse'} ({conflicts_count} conflits)"
+        auction_options[label] = auction
+
+    selected_label = st.selectbox(
+        "Selectionner une enchere a valider:",
+        list(auction_options.keys()),
+        key="validation_select"
+    )
+
+    if selected_label:
+        selected_auction = auction_options[selected_label]
+
+        # Show validation summary
+        render_validation_summary(selected_auction)
+
+        st.divider()
+
+        # Render the validation interface
+        render_validation_tab(selected_auction, db)
 
 
 def show_dashboard(db: Database):
@@ -817,7 +1183,7 @@ def show_all_auctions(db: Database):
                 with btn_col1:
                     if st.button("📋", key=f"analyze_list_{idx}", help="Analyse détaillée"):
                         st.session_state.selected_auction_id = auction.id
-                        st.toast("👆 Allez à l'onglet 'Analyse détaillée'", icon="📋")
+                        st.toast("👆 Allez à l'onglet 'Analyses' > 'Analyse détaillée'", icon="📋")
                 with btn_col2:
                     if auction.url:
                         st.link_button("🔗", auction.url, help="Voir l'annonce")
@@ -1672,148 +2038,6 @@ def display_full_auction_card(auction):
                 st.link_button("🌐 Site avocat", site_url, use_container_width=True)
 
 
-def geocode_address(address: str, city: str, postal_code: str) -> tuple:
-    """Geocode an address using French government API (most precise) with Nominatim fallback"""
-    import requests
-    import re
-
-    # Clean and normalize address
-    address_clean = (address or "").strip()
-    city_clean = (city or "").strip()
-    postal_code_clean = (postal_code or "").strip()
-
-    # Strategy 1: French Government API (api-adresse.data.gouv.fr) - most precise for France
-    if address_clean or city_clean:
-        try:
-            # Build query with address components
-            query_parts = []
-            if address_clean:
-                query_parts.append(address_clean)
-            if city_clean:
-                query_parts.append(city_clean)
-
-            query = " ".join(query_parts)
-
-            params = {
-                "q": query,
-                "limit": 1,
-            }
-            # Add postcode filter for more precision
-            if postal_code_clean and postal_code_clean.isdigit():
-                params["postcode"] = postal_code_clean
-
-            response = requests.get(
-                "https://api-adresse.data.gouv.fr/search/",
-                params=params,
-                headers={"User-Agent": "ImmoAgent/1.0"},
-                timeout=5
-            )
-
-            if response.status_code == 200:
-                data = response.json()
-                if data.get("features") and len(data["features"]) > 0:
-                    coords = data["features"][0]["geometry"]["coordinates"]
-                    # GeoJSON format: [lon, lat]
-                    return float(coords[1]), float(coords[0])
-        except Exception:
-            pass
-
-    # Strategy 2: Try with just postcode and city for broader match
-    if postal_code_clean and city_clean:
-        try:
-            response = requests.get(
-                "https://api-adresse.data.gouv.fr/search/",
-                params={
-                    "q": city_clean,
-                    "postcode": postal_code_clean,
-                    "type": "municipality",
-                    "limit": 1,
-                },
-                headers={"User-Agent": "ImmoAgent/1.0"},
-                timeout=5
-            )
-            if response.status_code == 200:
-                data = response.json()
-                if data.get("features") and len(data["features"]) > 0:
-                    coords = data["features"][0]["geometry"]["coordinates"]
-                    return float(coords[1]), float(coords[0])
-        except Exception:
-            pass
-
-    # Strategy 3: Nominatim fallback
-    full_query = f"{address_clean}, {postal_code_clean} {city_clean}, France" if address_clean else f"{postal_code_clean} {city_clean}, France"
-    try:
-        response = requests.get(
-            "https://nominatim.openstreetmap.org/search",
-            params={
-                "q": full_query,
-                "format": "json",
-                "limit": 1,
-                "countrycodes": "fr"
-            },
-            headers={"User-Agent": "ImmoAgent/1.0"},
-            timeout=5
-        )
-        if response.status_code == 200 and response.json():
-            data = response.json()[0]
-            return float(data["lat"]), float(data["lon"])
-    except Exception:
-        pass
-
-    # Strategy 4: Nominatim structured search
-    if city_clean:
-        try:
-            response = requests.get(
-                "https://nominatim.openstreetmap.org/search",
-                params={
-                    "city": city_clean,
-                    "postalcode": postal_code_clean,
-                    "country": "France",
-                    "format": "json",
-                    "limit": 1,
-                },
-                headers={"User-Agent": "ImmoAgent/1.0"},
-                timeout=5
-            )
-            if response.status_code == 200 and response.json():
-                data = response.json()[0]
-                return float(data["lat"]), float(data["lon"])
-        except Exception:
-            pass
-
-    # Fallback coordinates for major cities
-    city_coords = {
-        "marseille": (43.2965, 5.3698),
-        "aix-en-provence": (43.5297, 5.4474),
-        "toulon": (43.1242, 5.9280),
-        "aubagne": (43.2927, 5.5708),
-        "hyeres": (43.1204, 6.1286),
-        "la ciotat": (43.1748, 5.6047),
-        "martigues": (43.4053, 5.0476),
-        "frejus": (43.4330, 6.7370),
-        "draguignan": (43.5366, 6.4647),
-        "la seyne-sur-mer": (43.0833, 5.8833),
-        "salon-de-provence": (43.6400, 5.0970),
-        "istres": (43.5150, 4.9870),
-        "vitrolles": (43.4550, 5.2480),
-        "arles": (43.6770, 4.6300),
-        "tarascon": (43.8060, 4.6600),
-        "gardanne": (43.4540, 5.4690),
-        "miramas": (43.5850, 5.0010),
-        "saint-raphael": (43.4250, 6.7680),
-        "six-fours-les-plages": (43.0930, 5.8200),
-        "bandol": (43.1350, 5.7520),
-        "sanary-sur-mer": (43.1190, 5.8010),
-        "ollioules": (43.1410, 5.8520),
-    }
-    city_lower = city_clean.lower() if city_clean else ""
-    for city_name, coords in city_coords.items():
-        if city_name in city_lower or city_lower in city_name:
-            return coords
-
-    return None, None
-
-
 def display_property_analysis(auction):
     """Display detailed property analysis with multi-source pricing"""
     import folium
@@ -2232,11 +2456,52 @@ def display_property_analysis(auction):
             # Show comparables if available (DVF transactions)
             if details.get('comparables'):
                 st.markdown("**Transactions comparables:**")
-                comps_df = pd.DataFrame(details['comparables'][:5])
+                comps_df = pd.DataFrame(details['comparables'][:10])
                 if not comps_df.empty:
                     # Format columns for display
-                    display_cols = [c for c in comps_df.columns if c not in ['url']]
+                    display_cols = [c for c in comps_df.columns if c not in ['url', 'latitude', 'longitude', 'distance_km']]
                     st.dataframe(comps_df[display_cols], hide_index=True, use_container_width=True)
+
+                # Mini-map for DVF comparables
+                if source_type == 'dvf' and auction.latitude and auction.longitude:
+                    comps_with_coords = [c for c in details['comparables'] if c.get('latitude') and c.get('longitude')]
+                    if comps_with_coords:
+                        st.markdown("**🗺️ Carte des transactions DVF:**")
+                        import folium
+                        from streamlit_folium import st_folium
+
+                        # Create mini-map centered on auction
+                        dvf_map = folium.Map(
+                            location=[auction.latitude, auction.longitude],
+                            zoom_start=16,
+                            tiles='cartodbpositron'
+                        )
+
+                        # Add auction marker (red)
+                        folium.Marker(
+                            [auction.latitude, auction.longitude],
+                            popup=f"<b>🏠 Bien aux enchères</b><br>{auction.adresse}",
+                            icon=folium.Icon(color='red', icon='home', prefix='fa')
+                        ).add_to(dvf_map)
+
+                        # Add DVF transaction markers (blue)
+                        for comp in comps_with_coords[:20]:
+                            distance_text = f"<br>Distance: {comp['distance_km']*1000:.0f}m" if comp.get('distance_km') else ""
+                            folium.CircleMarker(
+                                [comp['latitude'], comp['longitude']],
+                                radius=6,
+                                color='#2563eb',
+                                fill=True,
+                                fill_color='#3b82f6',
+                                fill_opacity=0.7,
+                                popup=f"<b>{comp.get('adresse', 'N/A')}</b><br>"
+                                      f"Prix: {comp.get('prix', 0):,.0f}€<br>"
+                                      f"Surface: {comp.get('surface', 0):.0f}m²<br>"
+                                      f"<b>{comp.get('prix_m2', 0):,.0f}€/m²</b>{distance_text}"
+                            ).add_to(dvf_map)
+
+                        st_folium(dvf_map, width=700, height=350, key=f"dvf_map_{auction.id}")
+                        st.caption(f"🔵 {len(comps_with_coords)} transactions DVF • 🔴 Bien aux enchères")
 
             st.markdown("---")
 

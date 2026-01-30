@@ -12,7 +12,43 @@ from loguru import logger
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 from config.settings import DATABASE_PATH
-from src.storage.models import Auction, Lawyer, PropertyType, AuctionStatus, PVStatus
+from src.storage.models import (
+    Auction, Lawyer, PropertyType, AuctionStatus, PVStatus,
+    ConsolidatedAuction, FieldConflict, UserChoice, SourceData
+)
+
+
+def normalize_property_type(type_bien: Optional[str]) -> PropertyType:
+    """Normalize property type string to PropertyType enum"""
+    if not type_bien:
+        return PropertyType.AUTRE
+
+    normalized = type_bien.lower().strip()
+
+    # Handle plural and variant forms
+    mapping = {
+        "appartement": PropertyType.APPARTEMENT,
+        "appartements": PropertyType.APPARTEMENT,
+        "maison": PropertyType.MAISON,
+        "maisons": PropertyType.MAISON,
+        "local_commercial": PropertyType.LOCAL_COMMERCIAL,
+        "local commercial": PropertyType.LOCAL_COMMERCIAL,
+        "locaux-commerciaux": PropertyType.LOCAL_COMMERCIAL,
+        "locaux commerciaux": PropertyType.LOCAL_COMMERCIAL,
+        "immeuble": PropertyType.LOCAL_COMMERCIAL,
+        "immeubles": PropertyType.LOCAL_COMMERCIAL,
+        "terrain": PropertyType.TERRAIN,
+        "terrains": PropertyType.TERRAIN,
+        "parking": PropertyType.PARKING,
+        "parkings": PropertyType.PARKING,
+        "box": PropertyType.PARKING,
+        "garage": PropertyType.PARKING,
+        "cave": PropertyType.AUTRE,
+        "autre": PropertyType.AUTRE,
+        "autres": PropertyType.AUTRE,
+    }
+
+    return mapping.get(normalized, PropertyType.AUTRE)
 
 
 class Database:
@@ -145,6 +181,51 @@ class Database:
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_adj_code_postal ON adjudication_results(code_postal)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_adj_date ON adjudication_results(date_adjudication)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_adj_type ON adjudication_results(type_bien)")
+
+            # Consolidated auctions table - stores merged data from multiple sources
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS consolidated_auctions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    matching_key TEXT UNIQUE NOT NULL,
+                    sources TEXT,  -- JSON array ["licitor", "vench"]
+                    source_urls TEXT,  -- JSON {"licitor": "url1", ...}
+                    source_data TEXT,  -- JSON full data by source
+                    auction_ids TEXT,  -- JSON {"licitor": 1, "vench": 2}
+                    conflicts TEXT,  -- JSON {field: FieldConflict}
+                    user_choices TEXT,  -- JSON {field: UserChoice}
+                    pending_validation TEXT,  -- JSON array of field names
+                    adresse TEXT,
+                    code_postal TEXT,
+                    ville TEXT,
+                    department TEXT,
+                    latitude REAL,
+                    longitude REAL,
+                    type_bien TEXT,
+                    surface REAL,
+                    nb_pieces INTEGER,
+                    nb_chambres INTEGER,
+                    etage INTEGER,
+                    description TEXT,
+                    description_detaillee TEXT,
+                    occupation TEXT,
+                    cadastre TEXT,
+                    date_vente DATE,
+                    heure_vente TEXT,
+                    tribunal TEXT,
+                    mise_a_prix REAL,
+                    avocat_nom TEXT,
+                    avocat_telephone TEXT,
+                    avocat_email TEXT,
+                    photos TEXT,  -- JSON array
+                    documents TEXT,  -- JSON array
+                    confidence_score REAL,
+                    last_consolidated TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_cons_date_vente ON consolidated_auctions(date_vente)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_cons_tribunal ON consolidated_auctions(tribunal)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_cons_confidence ON consolidated_auctions(confidence_score)")
 
             logger.info(f"Database initialized at {self.db_path}")
 
@@ -381,7 +462,7 @@ class Database:
             department=row["department"] or "",
             latitude=row["latitude"],
             longitude=row["longitude"],
-            type_bien=PropertyType(row["type_bien"]) if row["type_bien"] else PropertyType.AUTRE,
+            type_bien=normalize_property_type(row["type_bien"]),
             surface=row["surface"],
             nb_pieces=row["nb_pieces"],
             nb_chambres=row["nb_chambres"],
@@ -697,3 +778,251 @@ class Database:
                 LIMIT ?
             """, (limit,))
             return [self._row_to_auction(row) for row in cursor.fetchall()]
+
+    # ===== CONSOLIDATED AUCTIONS =====
+
+    def save_consolidated_auction(self, auction: ConsolidatedAuction) -> int:
+        """Save or update a consolidated auction"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+
+            # Serialize complex fields to JSON
+            sources_json = json.dumps(auction.sources)
+            source_urls_json = json.dumps(auction.source_urls)
+            source_data_json = json.dumps({
+                k: v.to_dict() for k, v in auction.source_data.items()
+            })
+            auction_ids_json = json.dumps(auction.auction_ids)
+            conflicts_json = json.dumps({
+                k: v.to_dict() for k, v in auction.conflicts.items()
+            })
+            user_choices_json = json.dumps({
+                k: v.to_dict() for k, v in auction.user_choices.items()
+            })
+            pending_json = json.dumps(auction.pending_validation)
+            photos_json = json.dumps(auction.photos)
+            documents_json = json.dumps(auction.documents)
+
+            if auction.id:
+                # Update
+                cursor.execute("""
+                    UPDATE consolidated_auctions SET
+                        matching_key = ?, sources = ?, source_urls = ?, source_data = ?,
+                        auction_ids = ?, conflicts = ?, user_choices = ?, pending_validation = ?,
+                        adresse = ?, code_postal = ?, ville = ?, department = ?,
+                        latitude = ?, longitude = ?, type_bien = ?, surface = ?,
+                        nb_pieces = ?, nb_chambres = ?, etage = ?, description = ?,
+                        description_detaillee = ?, occupation = ?, cadastre = ?,
+                        date_vente = ?, heure_vente = ?, tribunal = ?, mise_a_prix = ?,
+                        avocat_nom = ?, avocat_telephone = ?, avocat_email = ?,
+                        photos = ?, documents = ?, confidence_score = ?,
+                        last_consolidated = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                """, (
+                    auction.matching_key, sources_json, source_urls_json, source_data_json,
+                    auction_ids_json, conflicts_json, user_choices_json, pending_json,
+                    auction.adresse, auction.code_postal, auction.ville, auction.department,
+                    auction.latitude, auction.longitude,
+                    auction.type_bien.value if auction.type_bien else None, auction.surface,
+                    auction.nb_pieces, auction.nb_chambres, auction.etage, auction.description,
+                    auction.description_detaillee, auction.occupation, auction.cadastre,
+                    auction.date_vente.isoformat() if auction.date_vente else None,
+                    auction.heure_vente, auction.tribunal, auction.mise_a_prix,
+                    auction.avocat_nom, auction.avocat_telephone, auction.avocat_email,
+                    photos_json, documents_json, auction.confidence_score,
+                    auction.id
+                ))
+                return auction.id
+            else:
+                # Insert or replace (upsert based on matching_key)
+                cursor.execute("""
+                    INSERT OR REPLACE INTO consolidated_auctions (
+                        matching_key, sources, source_urls, source_data, auction_ids,
+                        conflicts, user_choices, pending_validation,
+                        adresse, code_postal, ville, department, latitude, longitude,
+                        type_bien, surface, nb_pieces, nb_chambres, etage,
+                        description, description_detaillee, occupation, cadastre,
+                        date_vente, heure_vente, tribunal, mise_a_prix,
+                        avocat_nom, avocat_telephone, avocat_email,
+                        photos, documents, confidence_score
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    auction.matching_key, sources_json, source_urls_json, source_data_json,
+                    auction_ids_json, conflicts_json, user_choices_json, pending_json,
+                    auction.adresse, auction.code_postal, auction.ville, auction.department,
+                    auction.latitude, auction.longitude,
+                    auction.type_bien.value if auction.type_bien else None, auction.surface,
+                    auction.nb_pieces, auction.nb_chambres, auction.etage, auction.description,
+                    auction.description_detaillee, auction.occupation, auction.cadastre,
+                    auction.date_vente.isoformat() if auction.date_vente else None,
+                    auction.heure_vente, auction.tribunal, auction.mise_a_prix,
+                    auction.avocat_nom, auction.avocat_telephone, auction.avocat_email,
+                    photos_json, documents_json, auction.confidence_score
+                ))
+                return cursor.lastrowid
+
+    def _row_to_consolidated_auction(self, row) -> ConsolidatedAuction:
+        """Convert database row to ConsolidatedAuction object"""
+        # Parse JSON fields
+        sources = json.loads(row["sources"]) if row["sources"] else []
+        source_urls = json.loads(row["source_urls"]) if row["source_urls"] else {}
+        auction_ids = json.loads(row["auction_ids"]) if row["auction_ids"] else {}
+
+        # Parse source_data
+        source_data = {}
+        if row["source_data"]:
+            raw_source_data = json.loads(row["source_data"])
+            for src, data in raw_source_data.items():
+                source_data[src] = SourceData(
+                    source=data["source"],
+                    url=data["url"],
+                    scraped_at=datetime.fromisoformat(data["scraped_at"]) if data.get("scraped_at") else datetime.now(),
+                    raw_data=data.get("raw_data", {})
+                )
+
+        # Parse conflicts
+        conflicts = {}
+        if row["conflicts"]:
+            raw_conflicts = json.loads(row["conflicts"])
+            for field, data in raw_conflicts.items():
+                conflicts[field] = FieldConflict.from_dict(data)
+
+        # Parse user_choices
+        user_choices = {}
+        if row["user_choices"]:
+            raw_choices = json.loads(row["user_choices"])
+            for field, data in raw_choices.items():
+                user_choices[field] = UserChoice.from_dict(data)
+
+        pending = json.loads(row["pending_validation"]) if row["pending_validation"] else []
+        photos = json.loads(row["photos"]) if row["photos"] else []
+        documents = json.loads(row["documents"]) if row["documents"] else []
+
+        return ConsolidatedAuction(
+            id=row["id"],
+            matching_key=row["matching_key"],
+            sources=sources,
+            source_urls=source_urls,
+            source_data=source_data,
+            auction_ids=auction_ids,
+            conflicts=conflicts,
+            user_choices=user_choices,
+            pending_validation=pending,
+            adresse=row["adresse"] or "",
+            code_postal=row["code_postal"] or "",
+            ville=row["ville"] or "",
+            department=row["department"] or "",
+            latitude=row["latitude"],
+            longitude=row["longitude"],
+            type_bien=normalize_property_type(row["type_bien"]),
+            surface=row["surface"],
+            nb_pieces=row["nb_pieces"],
+            nb_chambres=row["nb_chambres"],
+            etage=row["etage"],
+            description=row["description"] or "",
+            description_detaillee=row["description_detaillee"] or "",
+            occupation=row["occupation"] or "",
+            cadastre=row["cadastre"] or "",
+            date_vente=date.fromisoformat(row["date_vente"]) if row["date_vente"] else None,
+            heure_vente=row["heure_vente"],
+            tribunal=row["tribunal"] or "",
+            mise_a_prix=row["mise_a_prix"],
+            avocat_nom=row["avocat_nom"],
+            avocat_telephone=row["avocat_telephone"],
+            avocat_email=row["avocat_email"],
+            photos=photos,
+            documents=documents,
+            confidence_score=row["confidence_score"] or 0,
+            last_consolidated=datetime.fromisoformat(row["last_consolidated"]) if row["last_consolidated"] else datetime.now(),
+        )
+
+    def get_consolidated_auction(self, auction_id: int) -> Optional[ConsolidatedAuction]:
+        """Get consolidated auction by ID"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM consolidated_auctions WHERE id = ?", (auction_id,))
+            row = cursor.fetchone()
+            return self._row_to_consolidated_auction(row) if row else None
+
+    def get_consolidated_auction_by_key(self, matching_key: str) -> Optional[ConsolidatedAuction]:
+        """Get consolidated auction by matching key"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM consolidated_auctions WHERE matching_key = ?", (matching_key,))
+            row = cursor.fetchone()
+            return self._row_to_consolidated_auction(row) if row else None
+
+    def get_all_consolidated_auctions(self, limit: int = 100, offset: int = 0) -> List[ConsolidatedAuction]:
+        """Get all consolidated auctions"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT * FROM consolidated_auctions
+                ORDER BY date_vente
+                LIMIT ? OFFSET ?
+            """, (limit, offset))
+            return [self._row_to_consolidated_auction(row) for row in cursor.fetchall()]
+
+    def get_consolidated_with_conflicts(self) -> List[ConsolidatedAuction]:
+        """Get consolidated auctions that have unresolved conflicts"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT * FROM consolidated_auctions
+                WHERE pending_validation IS NOT NULL
+                AND pending_validation != '[]'
+                ORDER BY date_vente
+            """)
+            return [self._row_to_consolidated_auction(row) for row in cursor.fetchall()]
+
+    def resolve_consolidated_conflict(
+        self,
+        auction_id: int,
+        field_name: str,
+        chosen_value: Any,
+        chosen_source: str,
+        reason: str = None
+    ) -> Optional[ConsolidatedAuction]:
+        """Resolve a conflict for a consolidated auction"""
+        auction = self.get_consolidated_auction(auction_id)
+        if not auction:
+            return None
+
+        auction.resolve_conflict(field_name, chosen_value, chosen_source, reason)
+        self.save_consolidated_auction(auction)
+        return auction
+
+    def get_consolidated_stats(self) -> Dict[str, Any]:
+        """Get statistics about consolidated auctions"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+
+            stats = {}
+
+            # Total consolidated
+            cursor.execute("SELECT COUNT(*) FROM consolidated_auctions")
+            stats["total_consolidated"] = cursor.fetchone()[0]
+
+            # With conflicts
+            cursor.execute("""
+                SELECT COUNT(*) FROM consolidated_auctions
+                WHERE pending_validation IS NOT NULL AND pending_validation != '[]'
+            """)
+            stats["with_conflicts"] = cursor.fetchone()[0]
+
+            # By source count
+            cursor.execute("""
+                SELECT
+                    json_array_length(sources) as source_count,
+                    COUNT(*) as count
+                FROM consolidated_auctions
+                GROUP BY json_array_length(sources)
+            """)
+            stats["by_source_count"] = {row[0]: row[1] for row in cursor.fetchall()}
+
+            # Average confidence
+            cursor.execute("SELECT AVG(confidence_score) FROM consolidated_auctions")
+            avg = cursor.fetchone()[0]
+            stats["avg_confidence"] = round(avg, 1) if avg else 0
+
+            return stats

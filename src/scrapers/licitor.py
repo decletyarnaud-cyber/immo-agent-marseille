@@ -238,6 +238,34 @@ class LicitorScraper(BaseScraper):
             "salon-de-provence": "13300", "salon de provence": "13300", "vitrolles": "13127",
             "la ciotat": "13600", "gardanne": "13120", "miramas": "13140", "tarascon": "13150",
             "marignane": "13700", "cassis": "13260", "port-de-bouc": "13110",
+            # Bouches-du-Rhône (13) - Ajouts
+            "fos-sur-mer": "13270", "fos sur mer": "13270", "fos": "13270",
+            "carry-le-rouet": "13620", "carry le rouet": "13620",
+            "sausset-les-pins": "13960", "sausset les pins": "13960",
+            "châteauneuf-les-martigues": "13220", "chateauneuf-les-martigues": "13220",
+            "la penne-sur-huveaune": "13821", "la penne sur huveaune": "13821",
+            "plan-de-cuques": "13380", "plan de cuques": "13380",
+            "allauch": "13190", "gémenos": "13420", "gemenos": "13420",
+            "roquevaire": "13360", "peypin": "13124", "auriol": "13390",
+            "septèmes-les-vallons": "13240", "septemes-les-vallons": "13240",
+            "les pennes-mirabeau": "13170", "pennes-mirabeau": "13170",
+            "bouc-bel-air": "13320", "cabriès": "13480", "cabries": "13480",
+            "simiane-collongue": "13109", "mimet": "13105",
+            "gréasque": "13850", "greasque": "13850", "belcodène": "13720",
+            "la destrousse": "13112", "la bouilladisse": "13720",
+            "saint-savournin": "13119", "cadolive": "13950",
+            "trets": "13530", "rousset": "13790", "peynier": "13790",
+            "fuveau": "13710", "meyreuil": "13590", "le tholonet": "13100",
+            "beaurecueil": "13100", "vauvenargues": "13126",
+            "châteauneuf-le-rouge": "13790", "chateauneuf-le-rouge": "13790",
+            "puyloubier": "13114", "saint-antonin-sur-bayon": "13100",
+            "berre-l'étang": "13130", "berre l'etang": "13130", "berre": "13130",
+            "rognac": "13340", "velaux": "13880", "la fare-les-oliviers": "13580",
+            "lançon-provence": "13680", "lancon-provence": "13680",
+            "saint-chamas": "13250", "grans": "13450", "pélissanne": "13330",
+            "la barben": "13330", "lambesc": "13410", "rognes": "13840",
+            "saint-cannat": "13760", "eguilles": "13510", "éguilles": "13510",
+            "ventabren": "13122", "coudoux": "13111",
             # Var (83)
             "toulon": "83000", "la seyne-sur-mer": "83500", "la seyne sur mer": "83500",
             "hyères": "83400", "hyeres": "83400", "fréjus": "83600", "frejus": "83600",
@@ -249,6 +277,21 @@ class LicitorScraper(BaseScraper):
             "solliès-pont": "83210", "sollies pont": "83210", "cogolin": "83310",
             "sainte-maxime": "83120", "le lavandou": "83980", "bormes-les-mimosas": "83230",
             "carcès": "83570", "carces": "83570",
+            # Var (83) - Ajouts ressort TJ Toulon
+            "le beausset": "83330", "le-beausset": "83330",
+            "saint-cyr-sur-mer": "83270", "saint cyr sur mer": "83270",
+            "la cadière-d'azur": "83740", "la cadiere-d'azur": "83740", "la cadiere d'azur": "83740",
+            "le castellet": "83330", "évenos": "83330", "evenos": "83330",
+            "signes": "83870", "méounes-lès-montrieux": "83136",
+            "solliès-toucas": "83210", "solliès-ville": "83210",
+            "la farlède": "83210", "la farlede": "83210",
+            "cuers": "83390", "pierrefeu-du-var": "83390", "puget-ville": "83390",
+            "rocbaron": "83136", "garéoult": "83136", "gareoult": "83136",
+            "néoules": "83136", "neoules": "83136", "forcalqueiret": "83136",
+            "la roquebrussanne": "83136", "tourves": "83170",
+            "saint-maximin-la-sainte-baume": "83470", "saint maximin": "83470",
+            "nans-les-pins": "83860", "plan-d'aups-sainte-baume": "83640",
+            "riboux": "83136", "mazaugues": "83136",
         }
 
         # Extract city from URL (more patterns)
@@ -602,6 +645,8 @@ class LicitorScraper(BaseScraper):
                         auction = self.parse_auction_detail(full_url)
                         if auction:
                             auction.tribunal = name
+                            # Geocode the auction to get GPS coordinates
+                            auction = self.geocode_auction(auction)
                             all_auctions.append(auction)
 
         logger.info(f"[Licitor] Total: {len(all_auctions)} auctions scraped")

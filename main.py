@@ -27,6 +27,7 @@ from src.storage.database import Database
 from src.storage.csv_handler import CSVHandler
 from src.scrapers import LicitorScraper, EncherePubliquesScraper, VenchScraper
 from src.scrapers.cross_validator import CrossValidator
+from src.scrapers.consolidator import AuctionConsolidator
 from src.analysis import DVFClient, PropertyValuator
 
 
@@ -90,7 +91,58 @@ def run_scraping(cross_validate: bool = True):
             logger.warning(f"Failed to save auction: {e}")
 
     logger.info(f"Scraping complete. Total: {len(all_auctions)} auctions, {saved_count} saved")
+
+    # Consolidate auctions from all sources
+    run_consolidation(licitor_auctions, encheres_auctions, other_auctions, db)
+
     return all_auctions
+
+
+def run_consolidation(licitor_auctions=None, encheres_auctions=None, vench_auctions=None, db=None):
+    """Consolidate auctions from multiple sources and detect conflicts"""
+    logger.info("Starting multi-source consolidation...")
+
+    if db is None:
+        db = Database()
+
+    # If no auctions provided, load from database
+    if licitor_auctions is None or encheres_auctions is None or vench_auctions is None:
+        all_db_auctions = db.get_all_auctions(limit=1000)
+        licitor_auctions = [a for a in all_db_auctions if a.source == "licitor"]
+        encheres_auctions = [a for a in all_db_auctions if a.source == "encheres_publiques"]
+        vench_auctions = [a for a in all_db_auctions if a.source == "vench"]
+
+    # Prepare data for consolidator
+    auctions_by_source = {
+        "licitor": licitor_auctions or [],
+        "encheres_publiques": encheres_auctions or [],
+        "vench": vench_auctions or [],
+    }
+
+    # Filter out empty sources
+    auctions_by_source = {k: v for k, v in auctions_by_source.items() if v}
+
+    if not auctions_by_source:
+        logger.info("No auctions to consolidate")
+        return []
+
+    # Run consolidation
+    consolidator = AuctionConsolidator()
+    consolidated = consolidator.consolidate(auctions_by_source)
+
+    # Save consolidated auctions
+    saved = 0
+    conflicts_total = 0
+    for auction in consolidated:
+        try:
+            db.save_consolidated_auction(auction)
+            saved += 1
+            conflicts_total += len(auction.pending_validation)
+        except Exception as e:
+            logger.warning(f"Failed to save consolidated auction: {e}")
+
+    logger.info(f"Consolidation complete. {saved} consolidated auctions, {conflicts_total} conflicts detected")
+    return consolidated
 
 
 def run_analysis():
@@ -173,6 +225,9 @@ def main():
     # Web command
     subparsers.add_parser("web", help="Start the web interface")
 
+    # Consolidate command
+    subparsers.add_parser("consolidate", help="Consolidate auctions from all sources")
+
     # Full pipeline command
     subparsers.add_parser("run-all", help="Run full pipeline (scrape + analyze)")
 
@@ -188,6 +243,8 @@ def main():
         export_csv()
     elif args.command == "web":
         run_web()
+    elif args.command == "consolidate":
+        run_consolidation()
     elif args.command == "run-all":
         run_scraping()
         run_analysis()

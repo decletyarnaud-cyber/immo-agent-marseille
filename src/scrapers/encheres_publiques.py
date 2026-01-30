@@ -835,6 +835,8 @@ class EncherePubliquesScraper(BaseScraper):
                     seen_urls.add(auction_url)
                     auction = self.parse_auction_detail(auction_url)
                     if auction:
+                        # Geocode the auction to get GPS coordinates
+                        auction = self.geocode_auction(auction)
                         all_auctions.append(auction)
                         logger.info(f"[EnchèresPubliques] Found: {auction.ville} - {auction.type_bien.value if auction.type_bien else 'bien'}")
 
